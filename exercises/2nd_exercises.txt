@@ -1,0 +1,243 @@
+# Online Boutique — DevOps Exercises (Junior → Mid-level)
+
+---
+
+## 1. CONTAINERS & DOCKERFILES
+
+### 1.1 Audit every Dockerfile for bad practices
+Open each Dockerfile in src/*/. For each one, check:
+- Is it using a pinned base image tag or floating (e.g. :latest)?
+- Does it run as root or a non-root user?
+- Are build dependencies separated from the final runtime image (multi-stage build)?
+- Is the layer order optimised (dependencies before source code)?
+Write a findings list per service and fix at least two issues you find.
+> Hint: adservice and cartservice are good ones to start with — they differ significantly
+> in structure.
+
+### 1.2 Reduce an image size
+Pick any service and measure its Docker image size with `docker image ls`. Then try to reduce it:
+remove unnecessary packages, use a smaller base image (alpine or distroless), and clean up
+package manager caches in the same RUN layer. Measure before and after.
+> Hint: `docker history <image>` shows you which layer is adding the most weight.
+
+### 1.3 Add a .dockerignore file
+None of the services have a .dockerignore file. Pick two services and add one to each. Identify
+what files would be unnecessarily sent to the Docker build context without it (test files, docs,
+local configs). Verify with F`docker build` output that the context size decreases.
+> Hint: Run `docker build` with --progress=plain to see the full context transfer size.
+
+### 1.4 Build and tag an image following a real release convention
+Read `docs/releasing/make-docker-images.sh`. Understand the tagging strategy used. Then manually
+build one service image and tag it with three tags: a git commit SHA, a semver tag (e.g. v1.2.0),
+and latest. Push them to a local registry (run one with `docker run -d -p 5000:5000 registry:2`).
+> Hint: Tagging the same image ID multiple times costs no extra disk space.
+
+---
+
+## 2. KUBERNETES — DAY-TO-DAY OPERATIONS
+
+### 2.1 Deploy the app from scratch and verify it
+Apply all manifests in `kubernetes-manifests/` to a clean namespace. Use only kubectl — no
+shortcuts. Verify every pod reaches Running state, check logs for errors, and confirm the
+frontend is reachable. Time yourself. This is a drill you should be able to do in under 5 minutes.
+> Hint: `kubectl get pods -w` watches in real time. `kubectl describe pod <name>` explains
+> why a pod is stuck.
+
+### 2.2 Simulate and recover from a broken deployment
+Edit adservice's Deployment and change the image tag to a non-existent one (e.g. :broken).
+Apply it and observe: what does kubectl show? What does the frontend do? Then roll back using
+`kubectl rollout undo` and confirm recovery. Understand what ImagePullBackOff and CrashLoopBackOff
+mean and how to diagnose each.
+> Hint: `kubectl rollout history deployment/adservice` shows your rollout history.
+
+### 2.3 Exec into a running pod and debug
+Exec into the frontend pod with `kubectl exec -it`. From inside, try to reach another service
+using its Kubernetes DNS name (e.g. curl http://productcatalogservice:3550). Understand how
+Kubernetes internal DNS works and why service names resolve. Then try to reach a service that
+shouldn't be reachable from frontend — observe the behaviour.
+> Hint: Service DNS format is <service-name>.<namespace>.svc.cluster.local
+
+### 2.4 Write a readiness probe for a service that is missing one
+Some services in kubernetes-manifests/ have readiness probes, some do not. Find one that is
+missing a probe, add one (gRPC, HTTP, or TCP depending on the service), and verify Kubernetes
+starts using it by checking `kubectl describe pod`. Understand what happens during a rolling
+update without a readiness probe.
+> Hint: For gRPC services, use grpc liveness/readiness probe type or exec a grpc_health_probe binary.
+
+### 2.5 Configure horizontal pod autoscaling
+Add an HPA (HorizontalPodAutoscaler) manifest for the frontend service. Set it to scale between
+2 and 5 replicas based on CPU utilisation (target 60%). Apply it and then generate load using
+the loadgenerator. Watch the HPA respond with `kubectl get hpa -w`.
+> Hint: Metrics Server must be running in your cluster for HPA to work. Install it if needed.
+
+### 2.6 Drain a node and observe pod rescheduling
+If using a multi-node local cluster (e.g. kind with multiple nodes), cordon and drain one node.
+Observe which pods get rescheduled and how long the disruption lasts. Then uncordon the node.
+Understand PodDisruptionBudgets and why you'd add one to a critical service like cartservice.
+> Hint: `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`
+
+---
+
+## 3. CI/CD
+
+### 3.1 Understand the existing Cloud Build pipeline
+Read `cloudbuild.yaml` thoroughly. Map out every step: what it builds, what it pushes, what
+substitution variables it uses. Identify: what would fail first if run in a fresh project with
+no setup? What secrets or permissions does it assume exist?
+> Hint: Look for $PROJECT_ID and $COMMIT_SHA — these are GCB built-ins vs. user-defined vars.
+
+### 3.2 Write a local CI script
+Write a shell script that does locally what cloudbuild.yaml does in CI: lint/test one service,
+build its Docker image, and tag it. Use it as a pre-push hook. Keep it under 30 lines.
+> Hint: For Go services, `go vet ./...` and `go test ./...` are your lint and test commands.
+
+### 3.3 Add a GitHub Actions workflow (or equivalent)
+Write a .github/workflows/ci.yml that triggers on pull requests and runs:
+- Go tests for checkoutservice and frontend
+- A docker build (no push) for those same services
+Make sure it only runs the relevant service's job when files in that service's directory change
+(use paths: filters).
+> Hint: Use actions/setup-go and cache the Go module cache to keep runs fast.
+
+### 3.4 Implement a smoke test after deployment
+Write a shell script that, after applying the Kubernetes manifests, polls the frontend's /health
+endpoint (or the root) until it returns HTTP 200, with a timeout of 120 seconds. Exit non-zero
+if the timeout is reached. This is the kind of script that sits at the end of a deploy job.
+> Hint: `kubectl get svc frontend-external -o jsonpath='{.status.loadBalancer.ingress[0].ip}'`
+> gets the IP programmatically.
+
+---
+
+## 4. OBSERVABILITY & ALERTING
+
+### 4.1 Write a runbook for a pod CrashLoopBackOff
+Imagine you are on-call and get paged: "cartservice is CrashLoopBackOff". Write a runbook (a
+short step-by-step guide) for how to diagnose and resolve this. Cover: how to get the crash
+reason, how to check recent logs, how to check resource limits, and what the most common causes
+are in this specific service.
+> Hint: `kubectl logs <pod> --previous` shows logs from the crashed container, not the new one.
+
+### 4.2 Add CPU and memory requests/limits to every service
+Go through every manifest in kubernetes-manifests/ and ensure all containers have both requests
+and limits set. Research appropriate starting values based on what the service does. Understand
+what QoS class each pod gets (Guaranteed, Burstable, BestEffort) and why it matters for
+eviction order under node pressure.
+> Hint: requests == limits gives you Guaranteed QoS — the safest class.
+
+### 4.3 Set up Prometheus scraping for a service
+Choose one service that exposes a /metrics endpoint (or add one). Write a Prometheus scrape
+config or ServiceMonitor (if using the Prometheus Operator) that collects its metrics. Verify
+data appears in Prometheus. Then write one useful PromQL query (e.g. request rate or error rate).
+> Hint: The otel-collector config already exports some metrics — use that as a reference.
+
+### 4.4 Create a structured alert rule
+Write a Prometheus alerting rule (or equivalent) that fires when the frontend has had more than
+5% HTTP 5xx responses over the last 5 minutes. Include sensible labels: severity, team, and
+a runbook_url field. Understand the difference between a pending alert and a firing alert.
+> Hint: Use rate() and a ratio — not a raw count — so the alert scales with traffic.
+
+
+#####################
+
+
+1. Get your 'admin' user password by running:
+
+   kubectl get secret --namespace default grafana -o jsonpath="{.data.admin-password}" | base64 --decode ; echo
+
+
+2. The Grafana server can be accessed via port 80 on the following DNS name from within your cluster:
+
+   grafana.default.svc.cluster.local
+
+   Get the Grafana URL to visit by running these commands in the same shell:
+     export POD_NAME=$(kubectl get pods --namespace default -l "app.kubernetes.io/name=grafana,app.kubernetes.io/instance=grafana" -o jsonpath="{.items[0].metadata.name}")
+     kubectl --namespace default port-forward $POD_NAME 3000
+
+     ##########
+
+---
+
+## 5. INFRASTRUCTURE AS CODE
+
+### 5.1 Understand and extend the Terraform config
+Read all files in `terraform/`. Understand what resources are created and how variables are
+passed in via terraform.tfvars. Then add a new output that prints the Redis instance's host
+after apply. Run `terraform plan` to validate your change without applying.
+> Hint: outputs.tf already has examples — follow the same pattern.
+
+### 5.2 Parameterise a hardcoded value
+Find a value in the Terraform or Kubernetes manifests that is hardcoded but should be a variable
+(e.g. a region, a machine type, a replica count). Extract it into a proper variable with a
+description, type, and default. Update all references and validate nothing breaks.
+> Hint: Kubernetes replica counts in manifests are a great candidate — they vary per environment.
+
+### 5.3 Write a kustomize overlay for a staging environment
+Create a new kustomize overlay at `kustomize/overlays/staging/`. It should:
+- Use a different image tag than production (e.g. :staging)
+- Set replica count to 1 for all services
+- Add a ENVIRONMENT=staging env var to the frontend
+Keep the base/ untouched — all changes go in the overlay only.
+> Hint: Use strategic merge patches in the overlay to override only what differs.
+
+### 5.4 Simulate a secret rotation
+cartservice needs a Redis password in a real setup. Create a Kubernetes Secret for it, update
+the cartservice manifest to consume it as an env var, and then simulate rotating the secret
+(update the Secret value and restart the pod). Document the steps — this is a procedure you
+will run in production.
+> Hint: Kubernetes does not automatically restart pods when a Secret changes — you must do it.
+
+---
+
+## 6. NETWORKING & SECURITY
+
+### 6.1 Apply and test all network policies
+Apply the full set of network policies from `kustomize/components/network-policies/`. Then verify
+they work: exec into one pod and try to reach a service it should NOT be able to reach. Confirm
+the connection is blocked. Understand the default-deny policy and why it must be applied first.
+> Hint: `nc -zv <service> <port>` or `curl` inside a pod is your testing tool.
+
+### 6.2 Scan an image for vulnerabilities
+Run Trivy (or Grype) against one of the built service images:
+`trivy image <image-name>`
+Triage the findings: which are critical, which are in the OS layer vs. app dependencies, and
+which have a fix available? Write a short summary of what you would actually fix vs. accept as
+risk, and why.
+> Hint: Install trivy with `brew install trivy` on Mac.
+
+### 6.3 Set up TLS termination for the frontend
+Using a self-signed certificate (create one with openssl), configure the frontend Kubernetes
+Service or an ingress to serve HTTPS. Understand where TLS is terminated and what travels
+unencrypted inside the cluster. For bonus: look at the Istio manifests in istio-manifests/ and
+understand how a service mesh shifts this responsibility.
+> Hint: `openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout tls.key -out tls.crt`
+
+---
+
+## 7. SKAFFOLD & LOCAL DEVELOPMENT WORKFLOW
+
+### 7.1 Understand and use skaffold.yaml
+Read `skaffold.yaml` fully. Understand the three phases it manages: build, test, deploy. Run
+`skaffold dev` and observe the hot-reload behaviour when you change a source file. Identify
+which services benefit most from fast iteration and which are slow to rebuild.
+> Hint: skaffold dev watches for file changes and rebuilds/redeploys only what changed.
+
+### 7.2 Add a skaffold profile for a lightweight local setup
+Add a profile to skaffold.yaml called `local-light` that only builds and deploys: frontend,
+productcatalogservice, cartservice, and the loadgenerator. This is the minimal set to test the
+add-to-cart flow. Activate it with `skaffold dev --profile local-light`.
+> Hint: Profiles can use the same manifests but with patches or subset selectors.
+
+---
+
+## SUGGESTED ORDER
+
+Week 1  →  1.1, 1.2, 2.1, 2.2          (containers and basic kubectl)
+Week 2  →  2.3, 2.4, 2.5, 3.4          (kubernetes operations + deployment validation)
+Week 3  →  3.1, 3.2, 3.3               (CI/CD pipeline work)
+Week 4  →  4.1, 4.2, 4.3               (observability and capacity)
+Week 5  →  5.1, 5.2, 5.3, 5.4          (IaC and environment management)
+Week 6  →  6.1, 6.2, 6.3, 7.1, 7.2    (security and dev workflow)
+
+The mark of a mid-level DevOps engineer is not just doing these tasks — it's being able to
+do them under pressure, explain the reasoning behind each decision, and write it up so the
+next person on call can follow your steps.

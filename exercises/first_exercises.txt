@@ -1,0 +1,143 @@
+# Online Boutique — Junior → Mid-level Exercises
+
+---
+
+## 1. UNDERSTAND THE SYSTEM
+
+### 1.1 Trace a checkout request end-to-end
+Starting from `frontend/handlers.go` (PlaceOrder handler), follow the gRPC calls through
+`checkoutservice/main.go` → payment, shipping, and email services. Draw a sequence diagram
+on paper. Understand what each service does and why it exists as a separate process.
+> Hint: Read demo.proto first — every service's API contract is defined there.
+
+### 1.2 Read and explain every Kubernetes manifest
+Open each file in `kubernetes-manifests/`. For every service, identify: what port it exposes,
+what environment variables it needs, its CPU/memory limits, and whether it uses a LoadBalancer
+or ClusterIP. Write a one-line summary per service.
+> Hint: cartservice is the only one connecting to Redis — notice how the address is injected
+> via env var rather than hardcoded.
+
+### 1.3 Map all inter-service communication
+Build a dependency graph (even on paper). Who calls whom? Start from `frontend/rpc.go` and
+`checkoutservice/main.go`. You'll find the frontend is the most coupled service — understand why
+that is an intentional design choice, not a mistake.
+> Hint: The loadgenerator's locustfile.py gives you the full user journey for free.
+
+---
+
+## 2. MODIFY & EXTEND
+
+### 2.1 Add a new product to the catalog
+Edit `src/productcatalogservice/products.json`. Add a product with all required fields. Rebuild
+only the productcatalogservice container and verify it appears in the frontend. Then read
+`catalog_loader.go` to understand how the file is loaded at startup.
+> Hint: You only need to rebuild productcatalogservice — not the whole stack.
+
+### 2.2 Add a field to the checkout confirmation email
+Edit `src/emailservice/templates/confirmation.html` to include the shipping address in the email
+body. Trace back to demo.proto to understand the SendOrderConfirmation request shape. No proto
+changes are needed — the data is already passed in.
+> Hint: Read email_server.py to see exactly which template variables are available.
+
+### 2.3 Add a request timeout to a gRPC call
+In `frontend/rpc.go`, pick any gRPC client call and add a context timeout (e.g. 500ms) using
+`context.WithTimeout`. Then deliberately slow down the downstream service (add a sleep) and
+observe what the user sees. Understand how you'd surface a graceful error instead of a crash.
+> Hint: Check how ctx is already used in main.go and middleware.go before making changes.
+
+### 2.4 Write new unit tests for the money package
+Open `src/checkoutservice/money/money_test.go` — tests already exist. Add at least 3 new
+table-driven test cases covering edge cases: zero amounts, mismatched currencies, and potential
+overflow. Run them with `go test ./money/...`.
+> Hint: Look at how the existing tests construct the Money struct from demo.proto.
+
+### 2.5 Add cart item validation in cartservice
+In `src/cartservice/src/services/CartService.cs`, add validation that rejects a cart item if
+quantity exceeds 10. Return a proper gRPC error using StatusCode.InvalidArgument. Test it by
+trying to add 11 of an item through the frontend.
+> Hint: CartService.cs already handles EmptyCart and GetCart — follow the same pattern.
+
+---
+
+## 3. OBSERVABILITY
+
+### 3.1 Add structured logging to the checkout flow
+In `frontend/handlers.go`, add a structured log entry when a user completes a checkout.
+Include fields: user_currency, item_count, and total_cost. Match the existing logger style used
+in that file (check for logrus or stdlib log calls).
+> Hint: Search for existing log.Info calls in handlers.go to match the field naming convention.
+
+### 3.2 Understand the OpenTelemetry collector setup
+Read `kustomize/components/google-cloud-operations/otel-collector.yaml` and the collector-model.png
+diagram. Understand what the collector receives, how it processes traces, and where it exports them.
+Then find where spans are created in the Go services — search for otelgrpc in the go.mod files.
+> Hint: gRPC calls are traced automatically via the otelgrpc interceptor — find where it's wired in.
+
+---
+
+## 4. INFRASTRUCTURE
+
+### 4.1 Add a liveness probe to adservice
+Open `kubernetes-manifests/adservice.yaml`. It already has a readiness probe — add a liveness
+probe too. Understand the difference: readiness stops traffic to the pod, liveness restarts it.
+Verify the gRPC health check endpoint exists in AdService.java before relying on it.
+> Hint: Liveness and readiness can use the same gRPC health endpoint but serve different purposes.
+
+### 4.2 Understand the memorystore component
+Read `kustomize/components/memorystore/kustomization.yaml` and its README. Understand exactly
+what it patches in the base manifests. Then read `terraform/memorystore.tf` — what infrastructure
+does it create? What would you change to point a local cartservice at a real Redis instance?
+> Hint: Diff the default cartservice.yaml against the memorystore patch to see the exact change.
+
+### 4.3 Write a stricter network policy for recommendationservice
+Study the existing policies in `kustomize/components/network-policies/`. Then write a new version
+of network-policy-recommendationservice.yaml that ONLY allows ingress from the frontend pod and
+ONLY allows egress to productcatalogservice. Apply it and confirm checkout still works.
+> Hint: Use podSelector with matchLabels — find the label names in the deployment manifests.
+
+### 4.4 Add resource limits to the loadgenerator
+Open `kubernetes-manifests/loadgenerator.yaml`. Add CPU and memory requests and limits. Read
+locustfile.py to understand the workload before picking numbers. Then research: what actually
+happens to a container that exceeds its memory limit vs. its CPU limit?
+> Hint: Start conservative — 100m CPU request, 256Mi memory — then observe with kubectl top pods.
+
+---
+
+## 5. ARCHITECTURE
+
+### 5.1 Evaluate why cartservice is written in C#
+Read `src/cartservice/src/Program.cs` and `Startup.cs`. This is the only .NET service in an
+otherwise Go/Python/Java/Node codebase. Research what trade-offs this introduces: shared base
+images, build pipelines, on-call knowledge, Dockerfile complexity. Write a short pros/cons list.
+Then look at AlloyDBCartStore.cs and SpannerCartStore.cs — what pattern do they implement and
+why is ICartStore a good design?
+> Hint: This is about polyglot microservices — a real pattern with real costs.
+
+### 5.2 Understand why the frontend is a Go server, not a SPA
+The frontend (`src/frontend/`) is a server-rendered Go app, not a React/Vue SPA calling APIs.
+Read handlers.go and the templates/ directory. List the advantages and disadvantages of this
+approach for a demo app. What would have to change to convert it to a REST/GraphQL backend
+serving a JavaScript frontend?
+> Hint: Think about session state, the shopping cart, and how ads are injected.
+
+### 5.3 Design a new microservice
+Using `docs/adding-new-microservice.md` as a guide, design (you don't have to implement it) a
+"WishlistService" that lets users save products. Define: its proto interface, which services
+would call it, what storage it needs, its Kubernetes manifest structure, and what network
+policies it would require. Write this up as a short design doc.
+> Hint: Model it after a simple existing service like shippingservice — keep the scope tight.
+
+---
+
+## SUGGESTED ORDER
+
+If you're unsure where to start:
+
+  Week 1  →  1.1, 1.2, 1.3 (understand before changing anything)
+  Week 2  →  2.1, 2.2, 2.4 (small safe changes, build confidence)
+  Week 3  →  2.3, 2.5, 3.1 (behaviour changes + observability)
+  Week 4  →  4.1, 4.2, 4.3 (infrastructure layer)
+  Week 5  →  4.4, 5.1, 5.2, 5.3 (architecture thinking)
+
+The goal is not just to complete the tasks — it's to be able to explain every decision
+to a colleague without looking anything up.

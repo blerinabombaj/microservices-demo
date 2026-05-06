@@ -1,0 +1,104 @@
+# Copyright 2026 Google LLC
+name: "Continuous Integration - Main/Release"
+
+on:
+  push:
+    branches:
+      - main
+      - release/*
+    paths-ignore:
+      - '**/README.md'
+      - 'terraform/**'
+      - 'helm-chart/**'
+
+jobs:
+  # 1. STATIC ANALYSIS (SAST) - Scans code for vulnerabilities
+  static-analysis:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Languages used in Online Boutique
+        language: [ 'csharp', 'go', 'javascript', 'python', 'java' ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      # Autobuild attempts to compile the microservices for analysis
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # 2. UNIT TESTS
+  code-tests:
+    runs-on: [self-hosted, is-enabled]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      
+      - name: Go Unit Tests
+        run: |
+          for SERVICE in "shippingservice" "productcatalogservice"; do
+            pushd src/$SERVICE && go test && popd
+          done
+
+      - name: C# Unit Tests
+        run: dotnet test src/cartservice/
+
+  # 3. DEPLOYMENT & SMOKE TESTS (Requires SAST and Unit Tests to pass)
+  deployment-tests:
+    runs-on: [self-hosted, is-enabled]
+    needs: [static-analysis, code-tests]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build + Deploy to GKE
+        run: |
+          # Securely handle environment variables
+          PR_NUMBER=$(echo $GITHUB_REF | awk 'BEGIN { FS = "/" } ; { print $3 }')
+          NAMESPACE="pr${PR_NUMBER}"
+          echo "NAMESPACE=$NAMESPACE" >> $GITHUB_ENV
+          
+          yes | gcloud auth configure-docker us-docker.pkg.dev
+          gcloud container clusters get-credentials $PR_CLUSTER --region $REGION --project $PROJECT_ID
+          
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          
+          skaffold config set --global local-cluster false
+          skaffold run --default-repo=us-docker.pkg.dev/$PROJECT_ID/$GITHUB_REF --tag=$GITHUB_SHA --namespace=$NAMESPACE -p network-policies
+        env:
+          PROJECT_ID: "online-boutique-ci"
+          PR_CLUSTER: "prs-gke-cluster"
+          REGION: "us-central1"
+
+      - name: Wait For Pods
+        run: |
+          kubectl config set-context --current --namespace=$NAMESPACE
+          kubectl wait --for=condition=available --timeout=1000s --all deployments
+
+      - name: Smoke Test
+        run: |
+          # Ensure loadgenerator is healthy and reporting no errors
+          kubectl delete pod -l app=loadgenerator
+          sleep 30
+          ERROR_COUNT=$(kubectl logs -l app=loadgenerator | grep Aggregated | awk '{print $3}' | sed "s/[(][^)]*[)]//g" | head -n 1)
+          if [[ "$ERROR_COUNT" -gt "0" ]]; then
+            echo "Smoke test failed with $ERROR_COUNT errors"
+            exit 1
+          fi

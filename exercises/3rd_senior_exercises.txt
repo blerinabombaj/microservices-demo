@@ -1,0 +1,317 @@
+# Online Boutique — Mid → Senior DevOps Exercises
+
+These assume you have completed the previous batch. The shift here is from
+"doing tasks" to "owning systems": designing for failure, making architectural
+decisions, writing the tooling others rely on, and being the person who
+defines the standards.
+
+---
+
+## 1. PLATFORM RELIABILITY
+
+### 1.1 Define and measure SLOs for the frontend
+Define three Service Level Objectives for the frontend service:
+- Availability SLO: e.g. 99.5% of requests return non-5xx over a 30-day window
+- Latency SLO: e.g. 95% of requests complete under 500ms
+- Error budget: calculate how many minutes of downtime your availability SLO permits per month
+
+Then write the PromQL queries that would measure each one. Understand the difference between
+SLI (the metric), SLO (the target), and SLA (the contractual commitment). Document what your
+team should do differently when the error budget is 50% consumed vs. fully exhausted.
+> Hint: SLOs are not about perfection — 100% availability is the wrong target. Understand why.
+
+### 1.2 Implement a proper health check hierarchy
+The current health checks only verify the process is alive. Design and implement a deeper health
+check for checkoutservice that validates its actual dependencies: can it reach cartservice?
+Can it reach paymentservice? Return a structured JSON response with the status of each
+dependency. Understand the risk of cascading failures if a health check is too aggressive.
+> Hint: A health check that calls 5 downstream services can turn one failure into five.
+
+### 1.3 Chaos engineering — kill a dependency and observe
+Use `kubectl delete deployment paymentservice` while the loadgenerator is running. Observe:
+- How long until users see errors?
+- What error does the frontend return?
+- Does cartservice keep working (add to cart)?
+- Does checkoutservice degrade gracefully or crash?
+Restore the service and measure how long until the system fully recovers. Document everything
+as an incident report — as if it had happened in production unexpectedly.
+> Hint: This is a game day exercise. The goal is learning, not fixing everything perfectly.
+
+### 1.4 Implement circuit breaking with Istio
+Using the Istio manifests in `istio-manifests/` and `kustomize/components/service-mesh-istio/`
+as a starting point, configure a DestinationRule for productcatalogservice that enables circuit
+breaking: max 1 connection, max 1 pending request, and eject a host after 1 consecutive 5xx
+error for 30 seconds. Trigger the circuit breaker deliberately and observe the behaviour.
+> Hint: Circuit breaking protects the caller. Understand how it differs from a retry policy.
+
+### 1.5 Design a multi-region deployment strategy
+You do not need to implement this — design it. Given the current architecture, write a design
+doc covering: what would need to change to deploy Online Boutique to two regions, how the
+cartservice (stateful, Redis-backed) would handle this, what routing strategy you would use
+(active-active vs active-passive), and what the failure modes are for each approach.
+> Hint: The stateless services are trivial to multi-region. Focus your design energy on cart.
+
+---
+
+## 2. ADVANCED KUBERNETES
+
+### 2.1 Write a custom admission webhook (validating)
+Write a simple validating admission webhook that rejects any Deployment applied to the cluster
+that does not have both resource requests and limits set on every container. Deploy it to your
+local cluster. Test it by trying to apply a manifest without limits — it should be rejected with
+a clear error message.
+> Hint: You can write this in Go or Python. Use a self-signed cert for the webhook TLS.
+> cert-manager simplifies this significantly if you want to use it.
+
+### 2.2 Implement pod disruption budgets for all critical services
+Identify which services must maintain at least one running pod during voluntary disruptions
+(node drains, rolling updates). Write PodDisruptionBudget manifests for them. Then test them
+by draining a node and verifying that Kubernetes respects the budget and does not evict pods
+below the minimum available count.
+> Hint: A PDB with minAvailable: 1 on a single-replica deployment will block all node drains.
+> Understand when this is correct and when it is a problem.
+
+### 2.3 Configure pod topology spread constraints
+Add topology spread constraints to the frontend and checkoutservice deployments so that pods
+are spread across nodes (or availability zones if your cluster has them). Verify the spread
+with `kubectl get pods -o wide`. Understand why this is more flexible than hard anti-affinity
+rules and when you would use each.
+> Hint: topologyKey: kubernetes.io/hostname spreads across nodes.
+> topologyKey: topology.kubernetes.io/zone spreads across AZs.
+
+### 2.4 Implement RBAC for a CI service account
+Create a Kubernetes ServiceAccount for a hypothetical CI pipeline that needs to deploy to
+the online-boutique namespace. Write the minimum Role and RoleBinding that allows it to:
+apply Deployments, Services, and ConfigMaps — but nothing else. Verify it cannot delete
+namespaces or read Secrets. Test using `kubectl auth can-i` impersonating the service account.
+> Hint: `kubectl auth can-i list secrets --as=system:serviceaccount:default:ci-deployer`
+
+### 2.5 Build a custom operator for config reload
+Write a simple Kubernetes controller (operator) that watches a ConfigMap named
+`boutique-feature-flags` and automatically triggers a rolling restart of the frontend
+Deployment whenever that ConfigMap changes. Use controller-runtime (Go) or kopf (Python).
+This is the pattern behind many real-world operators.
+> Hint: The simplest approach: update an annotation on the Deployment with the ConfigMap's
+> resourceVersion — Kubernetes will roll the pods.
+
+---
+
+## 3. CI/CD — ADVANCED PIPELINES
+
+### 3.1 Implement GitOps with ArgoCD or Flux
+Set up ArgoCD (or Flux) pointing at your local repo's kubernetes-manifests/ or kustomize/
+directory. Make a change to a manifest, push it, and watch the tool sync the cluster.
+Understand the reconciliation loop and what happens when someone makes a manual kubectl change
+outside of GitOps — does the tool overwrite it? Should it?
+> Hint: ArgoCD's self-heal feature is the answer to the last question. Understand its trade-offs.
+
+### 3.2 Build a promotion pipeline across environments
+Extend your CI pipeline to implement environment promotion:
+1. A merge to main builds and pushes an image tagged with the git SHA
+2. It automatically deploys to staging (a separate namespace)
+3. A manual approval step gates promotion to production
+4. Production gets deployed with the same SHA-tagged image (not rebuilt)
+Document why rebuilding the image for production is wrong.
+> Hint: The image that passed staging tests must be byte-for-byte identical in production.
+> Rebuilding breaks this guarantee even if the source code is the same.
+
+### 3.3 Implement semantic versioning automation
+Write a pipeline step (or script) that automatically determines the next semantic version
+(major/minor/patch) based on conventional commit messages in the git log since the last tag.
+A commit message starting with feat: bumps minor, fix: bumps patch, and BREAKING CHANGE:
+bumps major. Output the new version and tag the commit.
+> Hint: Tools like semantic-release, svu, or a 30-line shell script can all do this.
+
+### 3.4 Write a rollback procedure that works under pressure
+Document and script a production rollback procedure for the frontend service. It should:
+- Identify the last known-good image tag from git history
+- Perform a kubectl rollout undo OR re-deploy the previous tag (understand the difference)
+- Verify health before closing the incident
+- Run end-to-end in under 2 minutes
+Time yourself running it. If it takes longer, automate more of it.
+> Hint: kubectl rollout undo only goes back one revision by default. Know its limitations.
+
+---
+
+## 4. OBSERVABILITY — PRODUCTION GRADE
+
+### 4.1 Build a RED dashboard
+Using Prometheus and Grafana (or similar), build a dashboard for the frontend service using
+the RED method: Rate (requests per second), Errors (error rate %), and Duration (latency
+percentiles: p50, p95, p99). The dashboard should show the last 24 hours and have a variable
+to switch between services.
+> Hint: Use histogram_quantile() for latency percentiles. Understand why averages are misleading.
+
+### 4.2 Implement distributed tracing end-to-end
+Ensure traces flow from the frontend through at least checkoutservice → paymentservice →
+emailservice in Jaeger or Zipkin (or Cloud Trace). Identify the slowest span in a checkout
+request. Write a one-page analysis of where latency is coming from and what you would
+investigate first.
+> Hint: The otel-collector is already configured — focus on making the traces visible and
+> reading them, not on instrumentation from scratch.
+
+### 4.3 Set up log aggregation and write useful queries
+Configure a log aggregation stack (Loki + Grafana, or similar). Ensure logs from all pods flow
+into it with proper labels (namespace, service, pod). Then write three useful queries:
+- All errors from checkoutservice in the last hour
+- Requests where the response time exceeded 1 second (if logged)
+- Cart operations by user session
+> Hint: Structured JSON logs (which you set up in the previous batch) are much easier to query.
+
+### 4.4 Implement alerting with proper routing
+Write alert rules for the three most important failure modes in this system: frontend down,
+checkoutservice error rate > 1%, and cartservice pod count < 1. Configure Alertmanager (or
+equivalent) to route critical alerts to one receiver and warning alerts to another. Add
+inhibition rules so a "frontend down" alert suppresses all downstream service alerts
+(they are noise when the frontend is gone).
+> Hint: Alert inhibition is underused and prevents pager fatigue. Understand it well.
+
+---
+
+## 5. SECURITY — HARDENING
+
+### 5.1 Implement Pod Security Standards
+Apply the restricted Pod Security Standard to the online-boutique namespace. Fix every
+manifest that violates it — you will likely need to add securityContext blocks, set
+runAsNonRoot: true, drop ALL capabilities, and set a read-only root filesystem.
+Document every change and explain why each control matters.
+> Hint: Start with `kubectl label namespace online-boutique
+> pod-security.kubernetes.io/warn=restricted` to see violations without blocking.
+
+### 5.2 Perform a supply chain security audit
+Trace the full supply chain for one service image:
+- What base image does it use? Who maintains it?
+- What packages are installed and are they pinned?
+- Is the Dockerfile build reproducible? Would running it twice give the same image digest?
+- What would an attacker need to compromise to inject malicious code into this image?
+Write a threat model for the build pipeline covering: developer machine, git repo, CI system,
+container registry, and cluster.
+> Hint: Image digest pinning (FROM golang@sha256:...) vs tag pinning (FROM golang:1.21) —
+> understand the security difference.
+
+### 5.3 Implement Secrets management with an external provider
+Replace the Kubernetes Secret used for Redis credentials (from the previous exercise batch)
+with a secret fetched from an external secrets manager. Use either:
+- External Secrets Operator + a local Vault instance, or
+- Sealed Secrets (simpler to set up locally)
+Understand the threat model difference: what does each approach protect against that plain
+Kubernetes Secrets do not?
+> Hint: Plain Kubernetes Secrets are base64-encoded, not encrypted at rest by default.
+> etcd encryption or an external provider changes this.
+
+### 5.4 Audit and tighten IAM for the Cloud Build pipeline
+Read `cloudbuild.yaml` and `terraform/`. Identify every GCP permission the Cloud Build
+service account needs. Write a custom IAM role that grants exactly those permissions and
+nothing more. Understand the principle of least privilege and what blast radius is reduced
+by separating the build SA from the deploy SA.
+> Hint: `gcloud iam roles describe roles/container.developer` shows what a predefined role
+> actually contains — it is usually far more than you need.
+
+---
+
+## 6. INFRASTRUCTURE AS CODE — ADVANCED
+
+### 6.1 Modularise the Terraform configuration
+Refactor `terraform/` to extract the networking, Redis (memorystore), and GKE cluster into
+separate reusable modules. Each module should have its own variables.tf, outputs.tf, and
+README. Another engineer should be able to use your module without reading its internals.
+> Hint: A good module has a narrow interface (few inputs) and clear outputs. If you need
+> 20 variables, the module is probably doing too much.
+
+### 6.2 Implement Terraform state management and locking
+Set up remote state for the Terraform config using GCS (or S3 for local simulation with
+LocalStack). Enable state locking. Then simulate two people running terraform apply at the
+same time — observe how locking prevents corruption. Document what happens if a lock is
+never released (a stuck lock) and how to break it safely.
+> Hint: `terraform force-unlock <lock-id>` exists for a reason. Know when it is safe to use it.
+
+### 6.3 Write Terratest tests for your Terraform modules
+Write at least one Terratest (Go) or pytest-terraform test that:
+- Runs terraform apply on your Redis module
+- Asserts the output host is non-empty
+- Runs terraform destroy to clean up
+Integrate this test into your CI pipeline as a nightly job (not on every commit — it is slow).
+> Hint: Testing IaC is often skipped at junior level. At senior level it is expected.
+
+### 6.4 Implement drift detection
+Write a script or pipeline job that runs `terraform plan` daily and alerts (Slack, email, or
+just a failing CI job) if there is any diff between the Terraform state and actual
+infrastructure. Understand what causes drift in practice and why it is dangerous.
+> Hint: `terraform plan -detailed-exitcode` returns exit code 2 if changes are needed,
+> 0 if no changes. Use this in your script.
+
+---
+
+## 7. ARCHITECTURE & DECISION MAKING
+
+### 7.1 Write an Architecture Decision Record (ADR)
+Write an ADR for one of the following decisions already made in this codebase:
+- Why gRPC instead of REST for inter-service communication
+- Why Redis for the cart instead of a relational database
+- Why server-side rendering for the frontend instead of a SPA
+
+Follow the standard ADR format: Context, Decision, Consequences (positive and negative).
+Keep it under one page. The goal is to understand the trade-offs well enough to defend the
+decision to a sceptical colleague or document it for a future engineer.
+> Hint: A good ADR acknowledges what was sacrificed, not just what was gained.
+
+### 7.2 Perform a capacity planning exercise
+Given the loadgenerator running at its default rate, measure actual resource usage for every
+service (kubectl top pods). Then calculate: at what request rate would you need to scale
+horizontally? What is the bottleneck service — the one that will hit its limits first?
+Build a simple spreadsheet model that estimates required replicas at 2x, 5x, and 10x current
+load, and what that costs in CPU and memory.
+> Hint: The bottleneck is rarely where you expect it. Measure, don't guess.
+
+### 7.3 Design a zero-downtime migration for cartservice storage
+Currently cartservice uses Redis. Design a migration plan to switch to a different backend
+(AlloyDB is already stubbed in AlloyDBCartStore.cs) with zero user-visible downtime.
+Your plan must cover:
+- How to run both backends simultaneously during migration
+- How to migrate existing cart data
+- How to roll back if the new backend has issues
+- How to verify the migration was successful
+You are not expected to implement this fully — the design and the reasoning matter.
+> Hint: The dual-write pattern and feature flags are your friends here.
+
+### 7.4 On-call simulation — respond to three incidents
+Create the following three failure conditions yourself, then respond to each as if you were
+on-call and had no prior knowledge of what you did:
+1. Set the productcatalogservice CPU limit to 10m (too low) and watch it throttle
+2. Fill the cartservice Redis with junk data so it returns errors
+3. Introduce a bad env var in checkoutservice that points to a wrong payment service address
+For each: write a short incident report (timeline, root cause, resolution, follow-up action).
+> Hint: The on-call skill is pattern recognition under pressure. Build the pattern library now,
+> while there are no consequences.
+
+---
+
+## WHAT SEPARATES THIS LEVEL FROM THE LAST
+
+At mid-level you could complete tasks reliably.
+At senior level the expectations shift:
+
+  - You design the system, not just operate it
+  - You write the runbooks others follow, not just follow them
+  - You make trade-off decisions and document why
+  - You define standards (Dockerfiles, manifests, pipelines) the team uses
+  - You reduce toil for everyone around you, not just yourself
+  - You are comfortable saying "I don't know, let me find out" and actually finding out
+
+These exercises are harder to grade because they have no single right answer.
+The quality is in your reasoning, not just in whether it works.
+
+---
+
+## SUGGESTED ORDER
+
+Week 1-2  →  1.1, 1.3, 1.4               (SLOs, chaos, circuit breaking)
+Week 3    →  2.1, 2.4, 4.1               (admission webhook, RBAC, RED dashboard)
+Week 4    →  3.1, 3.2, 3.4               (GitOps, promotion pipeline, rollback)
+Week 5    →  4.2, 4.3, 4.4               (tracing, log aggregation, alerting)
+Week 6    →  5.1, 5.2, 5.3               (security hardening)
+Week 7    →  6.1, 6.2, 6.4               (Terraform modules, state, drift)
+Week 8    →  7.1, 7.2, 7.3, 7.4          (architecture and on-call sim)
+
+Skip 1.5, 2.5, 6.3 until you are comfortable with the rest — they are the hardest
+in each section and reward you more once the foundations are solid.
