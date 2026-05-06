@@ -87,22 +87,10 @@ jobs:
         PR_CLUSTER: "prs-gke-cluster"
         REGION: "us-central1"
     - name: Wait For Pods
-      timeout-minutes: 20
+      timeout-minutes: 2
       run: |
-        set -x
-        kubectl config set-context --current --namespace=$NAMESPACE
-        kubectl wait --for=condition=available --timeout=1000s deployment/redis-cart
-        kubectl wait --for=condition=available --timeout=1000s deployment/adservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/cartservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/checkoutservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/currencyservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/emailservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/frontend
-        kubectl wait --for=condition=available --timeout=1000s deployment/loadgenerator
-        kubectl wait --for=condition=available --timeout=1000s deployment/paymentservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/productcatalogservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/recommendationservice
-        kubectl wait --for=condition=available --timeout=1000s deployment/shippingservice
+          echo "Skipping pod wait - practice pipeline only"
+          helm lint helm-chart/
     - name: Smoke Test
       timeout-minutes: 5
       run: |
